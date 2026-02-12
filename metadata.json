@@ -1,0 +1,7 @@
+{
+  "name": "PookieBoth",
+  "description": "A soft, pastel-themed mobile photo booth experience.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
