@@ -1,13 +1,14 @@
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Photo, FilterConfig, LayoutType, StickerItem, TextItem } from '../types';
 import { FILTERS, FRAME_COLORS, FRAME_PATTERNS, STICKER_PACKS, FONTS } from '../constants';
 import { useTheme } from './ThemeContext';
-import { Check, X, Download, Share2, Trash2, Sliders, Layout, Palette, Type, Smile, Move, Maximize, RotateCw, ArrowLeft, Printer, Sun, Contrast, Droplets } from 'lucide-react';
+import { Check, X, Download, Share2, Trash2, Sliders, Layout, Palette, Type, Smile, Move, Maximize, RotateCw, ArrowLeft, Printer, Sun, Contrast, Droplets, Crop } from 'lucide-react';
 import { playSound } from '../utils/audio';
 import { triggerHaptic } from '../utils/haptics';
 import { v4 as uuidv4 } from 'uuid';
 import QRCode from 'qrcode';
+import Cropper from 'react-easy-crop';
 
 interface EditorProps {
   photo: Photo;
@@ -20,10 +21,13 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
   const { colors } = useTheme();
   
   // -- State --
-  const [activeTab, setActiveTab] = useState<'filter' | 'adjust' | 'layout' | 'frame' | 'decor' | 'items'>('filter');
+  const [activeTab, setActiveTab] = useState<'filter' | 'adjust' | 'crop' | 'layout' | 'frame' | 'decor' | 'items'>('filter');
   const [showShareModal, setShowShareModal] = useState(false);
   const [qrCodeData, setQrCodeData] = useState<string | null>(null);
   
+  // Images (Source of Truth for rendering)
+  const [editedImages, setEditedImages] = useState<string[]>(photo.originalImages);
+
   // Image Adjustments
   const [selectedFilter, setSelectedFilter] = useState<FilterConfig>(FILTERS.find(f => f.name === photo.filter) || FILTERS[0]);
   const [adjustments, setAdjustments] = useState({
@@ -32,6 +36,13 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
       saturation: 100
   });
   
+  // Crop State
+  const [activeCropImageIndex, setActiveCropImageIndex] = useState(0);
+  const [crop, setCrop] = useState({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(1);
+  const [aspect, setAspect] = useState<number | undefined>(undefined); // undefined = free
+  const [croppedAreaPixels, setCroppedAreaPixels] = useState<any>(null);
+
   // Layout & Spacing
   const [layout, setLayout] = useState<LayoutType>(photo.layout || (photo.originalImages.length > 1 ? 'strip4' : 'single'));
   const [paddingSize, setPaddingSize] = useState(photo.padding ?? 40);
@@ -62,10 +73,68 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
   const sourceImagesRef = useRef<HTMLImageElement[]>([]);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // -- Auto-Save Logic --
+  const DRAFT_KEY = `pookieboth_draft_${photo.id}`;
+
+  // Load draft on mount
+  useEffect(() => {
+    try {
+      const savedDraft = localStorage.getItem(DRAFT_KEY);
+      if (savedDraft) {
+        const draft = JSON.parse(savedDraft);
+        if (draft.editedImages) setEditedImages(draft.editedImages);
+        if (draft.filter) {
+            const f = FILTERS.find(f => f.name === draft.filter);
+            if (f) setSelectedFilter(f);
+        }
+        if (draft.adjustments) setAdjustments(draft.adjustments);
+        if (draft.layout) setLayout(draft.layout);
+        if (draft.padding !== undefined) setPaddingSize(draft.padding);
+        if (draft.gap !== undefined) setGapSize(draft.gap);
+        if (draft.cornerRadius !== undefined) setCornerRadius(draft.cornerRadius);
+        if (draft.frameColor) setFrameColor(draft.frameColor);
+        if (draft.framePattern) setFramePattern(draft.framePattern);
+        if (draft.showWatermark !== undefined) setShowWatermark(draft.showWatermark);
+        if (draft.showDate !== undefined) setShowDate(draft.showDate);
+        if (draft.stickers) setStickers(draft.stickers);
+        if (draft.texts) setTexts(draft.texts);
+      }
+    } catch (e) {
+      console.warn("Failed to load draft", e);
+    }
+  }, [photo.id, DRAFT_KEY]);
+
+  // Save draft on change
+  useEffect(() => {
+    const draft = {
+        editedImages,
+        filter: selectedFilter.name,
+        adjustments,
+        layout,
+        padding: paddingSize,
+        gap: gapSize,
+        cornerRadius,
+        frameColor,
+        framePattern,
+        showWatermark,
+        showDate,
+        stickers,
+        texts
+    };
+    const timer = setTimeout(() => {
+        localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [editedImages, selectedFilter, adjustments, layout, paddingSize, gapSize, cornerRadius, frameColor, framePattern, showWatermark, showDate, stickers, texts, DRAFT_KEY]);
+
+  const clearDraft = () => {
+      localStorage.removeItem(DRAFT_KEY);
+  };
+
   // -- Initialization --
   useEffect(() => {
     const loadImages = async () => {
-        const promises = photo.originalImages.map(src => {
+        const promises = editedImages.map(src => {
             return new Promise<HTMLImageElement>((resolve, reject) => {
                 const img = new Image();
                 img.onload = () => resolve(img);
@@ -82,7 +151,7 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
         }
     };
     loadImages();
-  }, [photo.originalImages]);
+  }, [editedImages]); // Depend on editedImages instead of photo.originalImages
 
   // Re-render base image when structural props change
   useEffect(() => {
@@ -90,6 +159,70 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
     return () => clearTimeout(timer);
   }, [selectedFilter, adjustments, layout, frameColor, framePattern, cornerRadius, paddingSize, gapSize, showWatermark, showDate]);
 
+  // -- Crop Logic --
+  const onCropComplete = useCallback((croppedArea: any, croppedAreaPixels: any) => {
+    setCroppedAreaPixels(croppedAreaPixels);
+  }, []);
+
+  const createImage = (url: string): Promise<HTMLImageElement> =>
+    new Promise((resolve, reject) => {
+      const image = new Image();
+      image.addEventListener('load', () => resolve(image));
+      image.addEventListener('error', (error) => reject(error));
+      image.src = url;
+    });
+
+  const getCroppedImg = async (imageSrc: string, pixelCrop: any): Promise<string> => {
+    const image = await createImage(imageSrc);
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+
+    if (!ctx) {
+      return imageSrc;
+    }
+
+    canvas.width = pixelCrop.width;
+    canvas.height = pixelCrop.height;
+
+    ctx.drawImage(
+      image,
+      pixelCrop.x,
+      pixelCrop.y,
+      pixelCrop.width,
+      pixelCrop.height,
+      0,
+      0,
+      pixelCrop.width,
+      pixelCrop.height
+    );
+
+    return new Promise((resolve) => {
+       resolve(canvas.toDataURL('image/jpeg', 0.95));
+    });
+  };
+
+  const applyCrop = async () => {
+    try {
+        if (activeCropImageIndex >= editedImages.length) return;
+        
+        const croppedImage = await getCroppedImg(
+          editedImages[activeCropImageIndex],
+          croppedAreaPixels
+        );
+        
+        const newImages = [...editedImages];
+        newImages[activeCropImageIndex] = croppedImage;
+        setEditedImages(newImages);
+        
+        playSound('success');
+        triggerHaptic('success');
+        // Stay in crop mode but flash success or something? Or maybe just simple feedback.
+        // We'll reset zoom for UX
+        setZoom(1);
+    } catch (e) {
+        console.error(e);
+    }
+  };
 
   // -- Canvas Logic --
 
@@ -148,9 +281,6 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
     const f = selectedFilter;
     
     // Calculate total adjustments
-    // We normalize 100 as base. 
-    // e.g. f.brightness might be 110. adjustments.brightness might be 100 (normal) or 110 (+10%).
-    // We combine them multiplicatively for a natural feel.
     const totalBri = (f.brightness / 100) * (adjustments.brightness / 100) * 100;
     const totalCon = (f.contrast / 100) * (adjustments.contrast / 100) * 100;
     const totalSat = (f.saturate / 100) * (adjustments.saturation / 100) * 100;
@@ -505,9 +635,11 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
   const handleFinalSave = async () => {
     playSound('success');
     triggerHaptic('success');
+    clearDraft(); // Clear draft on successful save
     const finalUri = await bakeFinalImage();
     const updated: Photo = {
         ...photo,
+        originalImages: editedImages, // Save the edited versions
         uri: finalUri,
         layout,
         filter: selectedFilter.name,
@@ -603,59 +735,96 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
         <div className="absolute inset-0 opacity-5 bg-[radial-gradient(#000_1px,transparent_1px)] [background-size:16px_16px]"></div>
         
         {/* Layer Container */}
-        <div 
-            ref={containerRef}
-            className="relative shadow-2xl shadow-gray-200/50 rounded-sm transition-all duration-300 max-h-full max-w-full flex justify-center animate-pop"
-            onClick={() => { setSelectedLayerId(null); setActiveTab(activeTab === 'items' ? 'filter' : activeTab); }}
-        >
-            <img 
-                src={previewUri} 
-                alt="Preview" 
-                className="max-h-[55vh] max-w-full object-contain pointer-events-none"
-            />
+        {activeTab === 'crop' ? (
+             <div className="relative w-full h-full rounded-2xl overflow-hidden shadow-xl">
+                 <Cropper
+                    image={editedImages[activeCropImageIndex]}
+                    crop={crop}
+                    zoom={zoom}
+                    aspect={aspect}
+                    onCropChange={setCrop}
+                    onCropComplete={onCropComplete}
+                    onZoomChange={setZoom}
+                  />
+                  {/* Overlay Controls for Crop Apply (Floating) */}
+                  <div className="absolute bottom-6 right-6 z-50">
+                     <button 
+                        onClick={applyCrop}
+                        className="bg-white text-black p-4 rounded-full shadow-xl font-bold flex items-center gap-2 btn-bouncy hover:bg-green-50 hover:text-green-600"
+                     >
+                         <Check size={24} />
+                     </button>
+                  </div>
+                  {/* Multi-image selector if applicable */}
+                  {editedImages.length > 1 && (
+                      <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black/50 backdrop-blur-md rounded-full p-1 flex gap-1 z-50">
+                          {editedImages.map((_, i) => (
+                              <button 
+                                key={i}
+                                onClick={() => setActiveCropImageIndex(i)}
+                                className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold transition-all ${activeCropImageIndex === i ? 'bg-white text-black' : 'text-white hover:bg-white/20'}`}
+                              >
+                                  {i + 1}
+                              </button>
+                          ))}
+                      </div>
+                  )}
+             </div>
+        ) : (
+            <div 
+                ref={containerRef}
+                className="relative shadow-2xl shadow-gray-200/50 rounded-sm transition-all duration-300 max-h-full max-w-full flex justify-center animate-pop"
+                onClick={() => { setSelectedLayerId(null); setActiveTab(activeTab === 'items' ? 'filter' : activeTab); }}
+            >
+                <img 
+                    src={previewUri} 
+                    alt="Preview" 
+                    className="max-h-[55vh] max-w-full object-contain pointer-events-none"
+                />
 
-            {/* Render Stickers Overlay */}
-            {stickers.map(sticker => (
-                <div
-                    key={sticker.id}
-                    className={`absolute flex items-center justify-center cursor-move select-none transition-transform ${selectedLayerId === sticker.id ? 'ring-2 ring-blue-400 rounded-lg bg-black/5' : ''}`}
-                    style={{
-                        left: `${sticker.x}%`,
-                        top: `${sticker.y}%`,
-                        fontSize: `${40 * sticker.scale}px`,
-                        transform: `translate(-50%, -50%) rotate(${sticker.rotation}deg)`,
-                        zIndex: 10
-                    }}
-                    onMouseDown={(e) => { e.stopPropagation(); handleDrag(e, sticker.id, 'sticker'); setActiveTab('items'); }}
-                    onTouchStart={(e) => { e.stopPropagation(); handleDrag(e, sticker.id, 'sticker'); setActiveTab('items'); }}
-                >
-                    {sticker.emoji}
-                </div>
-            ))}
+                {/* Render Stickers Overlay */}
+                {stickers.map(sticker => (
+                    <div
+                        key={sticker.id}
+                        className={`absolute flex items-center justify-center cursor-move select-none transition-transform ${selectedLayerId === sticker.id ? 'ring-2 ring-blue-400 rounded-lg bg-black/5' : ''}`}
+                        style={{
+                            left: `${sticker.x}%`,
+                            top: `${sticker.y}%`,
+                            fontSize: `${40 * sticker.scale}px`,
+                            transform: `translate(-50%, -50%) rotate(${sticker.rotation}deg)`,
+                            zIndex: 10
+                        }}
+                        onMouseDown={(e) => { e.stopPropagation(); handleDrag(e, sticker.id, 'sticker'); setActiveTab('items'); }}
+                        onTouchStart={(e) => { e.stopPropagation(); handleDrag(e, sticker.id, 'sticker'); setActiveTab('items'); }}
+                    >
+                        {sticker.emoji}
+                    </div>
+                ))}
 
-            {/* Render Text Overlay */}
-            {texts.map(text => (
-                <div
-                    key={text.id}
-                    className={`absolute flex items-center justify-center cursor-move select-none whitespace-nowrap ${selectedLayerId === text.id ? 'ring-2 ring-blue-400 rounded-lg bg-black/5' : ''}`}
-                    style={{
-                        left: `${text.x}%`,
-                        top: `${text.y}%`,
-                        transform: `translate(-50%, -50%) rotate(${text.rotation}deg) scale(${text.scale})`,
-                        color: text.color,
-                        fontFamily: text.font === 'Pacifico' ? 'Pacifico, cursive' : text.font,
-                        fontSize: '24px',
-                        fontWeight: 'bold',
-                        textShadow: '0 2px 4px rgba(0,0,0,0.1)',
-                        zIndex: 11
-                    }}
-                    onMouseDown={(e) => { e.stopPropagation(); handleDrag(e, text.id, 'text'); setActiveTab('items'); }}
-                    onTouchStart={(e) => { e.stopPropagation(); handleDrag(e, text.id, 'text'); setActiveTab('items'); }}
-                >
-                    {text.text}
-                </div>
-            ))}
-        </div>
+                {/* Render Text Overlay */}
+                {texts.map(text => (
+                    <div
+                        key={text.id}
+                        className={`absolute flex items-center justify-center cursor-move select-none whitespace-nowrap ${selectedLayerId === text.id ? 'ring-2 ring-blue-400 rounded-lg bg-black/5' : ''}`}
+                        style={{
+                            left: `${text.x}%`,
+                            top: `${text.y}%`,
+                            transform: `translate(-50%, -50%) rotate(${text.rotation}deg) scale(${text.scale})`,
+                            color: text.color,
+                            fontFamily: text.font === 'Pacifico' ? 'Pacifico, cursive' : text.font,
+                            fontSize: '24px',
+                            fontWeight: 'bold',
+                            textShadow: '0 2px 4px rgba(0,0,0,0.1)',
+                            zIndex: 11
+                        }}
+                        onMouseDown={(e) => { e.stopPropagation(); handleDrag(e, text.id, 'text'); setActiveTab('items'); }}
+                        onTouchStart={(e) => { e.stopPropagation(); handleDrag(e, text.id, 'text'); setActiveTab('items'); }}
+                    >
+                        {text.text}
+                    </div>
+                ))}
+            </div>
+        )}
       </div>
 
       {/* Controls Panel */}
@@ -666,6 +835,7 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
             {[
                 { id: 'filter', icon: Sliders, label: 'Filter' },
                 { id: 'adjust', icon: Sun, label: 'Adjust' },
+                { id: 'crop', icon: Crop, label: 'Crop' },
                 { id: 'layout', icon: Layout, label: 'Layout' },
                 { id: 'decor', icon: Smile, label: 'Decor' },
                 { id: 'frame', icon: Palette, label: 'Frame' },
@@ -763,8 +933,45 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
                      </button>
                 </div>
             )}
+            
+            {/* 3. CROP TAB */}
+            {activeTab === 'crop' && (
+                <div className="flex flex-col gap-6 animate-fade-enter">
+                    <div className="flex justify-center gap-3">
+                         {[
+                             { label: 'Free', val: undefined },
+                             { label: '1:1', val: 1 },
+                             { label: '4:5', val: 4/5 },
+                             { label: '3:4', val: 3/4 },
+                             { label: '9:16', val: 9/16 },
+                         ].map((r) => (
+                             <button 
+                                key={r.label}
+                                onClick={() => setAspect(r.val)}
+                                className={`px-4 py-2 rounded-xl text-xs font-bold border-2 transition-all btn-bouncy ${aspect === r.val ? 'border-gray-800 bg-gray-50 text-black' : 'border-gray-100 text-gray-400'}`}
+                             >
+                                 {r.label}
+                             </button>
+                         ))}
+                    </div>
+                    <div className="flex items-center gap-4 px-4">
+                        <span className="text-xs font-bold text-gray-400 uppercase">Zoom</span>
+                        <input 
+                            type="range"
+                            value={zoom}
+                            min={1}
+                            max={3}
+                            step={0.1}
+                            aria-labelledby="Zoom"
+                            onChange={(e) => setZoom(Number(e.target.value))}
+                            className="flex-1 h-1.5 bg-gray-100 rounded-full appearance-none cursor-pointer accent-gray-800"
+                        />
+                    </div>
+                    <p className="text-center text-[10px] text-gray-400">Drag image to pan • Pinch to zoom</p>
+                </div>
+            )}
 
-            {/* 3. LAYOUT & SPACING TAB */}
+            {/* 4. LAYOUT & SPACING TAB */}
             {activeTab === 'layout' && (
                 <div className="flex flex-col gap-6 animate-fade-enter">
                      {/* Layout Selector */}
@@ -813,7 +1020,7 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
                 </div>
             )}
 
-            {/* 4. DECOR TAB (Stickers & Text) */}
+            {/* 5. DECOR TAB (Stickers & Text) */}
             {activeTab === 'decor' && (
                 <div className="flex flex-col gap-4 animate-fade-enter h-full">
                     {!isAddingText ? (
@@ -890,7 +1097,7 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
                 </div>
             )}
 
-            {/* 5. FRAME TAB */}
+            {/* 6. FRAME TAB */}
             {activeTab === 'frame' && (
                 <div className="flex flex-col gap-6 animate-fade-enter">
                      {/* Patterns */}
@@ -936,7 +1143,7 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
                 </div>
             )}
 
-            {/* 6. ITEMS TAB (Renamed from TUNE) */}
+            {/* 7. ITEMS TAB (Renamed from TUNE) */}
             {activeTab === 'items' && (
                 <div className="flex flex-col gap-4 animate-fade-enter h-full justify-center">
                     {activeLayer ? (
@@ -969,7 +1176,7 @@ export const Editor: React.FC<EditorProps> = ({ photo, onSave, onDiscard, onDele
                         <div className="space-y-6 flex flex-col items-center justify-center text-gray-400 h-full">
                             <p className="text-sm">Select a sticker or text to edit it.</p>
                              <button 
-                                onClick={() => { onDelete(); playSound('delete'); }}
+                                onClick={() => { onDelete(); clearDraft(); playSound('delete'); }}
                                 className="mt-8 w-full py-3 border border-gray-200 text-gray-400 rounded-xl text-xs font-bold flex items-center justify-center gap-2 hover:bg-gray-50"
                             >
                                 <Trash2 size={16} /> Delete Photo
